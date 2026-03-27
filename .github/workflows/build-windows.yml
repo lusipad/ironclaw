@@ -1,0 +1,68 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile (release or debug)"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-
+
+      - name: Build (release)
+        if: ${{ github.event.inputs.profile == 'release' || github.event.inputs.profile == '' }}
+        run: cargo build --release
+
+      - name: Build (debug)
+        if: ${{ github.event.inputs.profile == 'debug' }}
+        run: cargo build
+
+      - name: Upload release artifact
+        if: ${{ github.event.inputs.profile == 'release' || github.event.inputs.profile == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironclaw-windows-x86_64-release
+          path: target/release/ironclaw.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload debug artifact
+        if: ${{ github.event.inputs.profile == 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironclaw-windows-x86_64-debug
+          path: target/debug/ironclaw.exe
+          if-no-files-found: error
+          retention-days: 14
