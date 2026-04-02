@@ -186,14 +186,40 @@ pub(crate) fn parse_string_env(
     Ok(optional_env(key)?.unwrap_or_else(|| default.into()))
 }
 
+/// Extract an embedded IPv4 address from an IPv6 address.
+///
+/// Handles both IPv4-mapped (`::ffff:A.B.C.D`) and IPv4-compatible
+/// (`::A.B.C.D`) forms. The latter is deprecated (RFC 4291 §2.5.5.1)
+/// but still parseable by many stacks, so we must check it to prevent
+/// SSRF bypasses via IPv6 literals like `[::169.254.169.254]`.
+fn ipv6_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    // IPv4-mapped: ::ffff:A.B.C.D
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // IPv4-compatible: ::A.B.C.D (first 96 bits are zero, segment 5 is 0)
+    let segs = v6.segments();
+    if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0
+    {
+        let o = v6.octets();
+        let v4 = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+        // Skip the all-zeros case (:: = unspecified) — handled separately.
+        if !v4.is_unspecified() {
+            return Some(v4);
+        }
+    }
+    None
+}
+
 /// Returns true if the IP is a cloud metadata endpoint (169.254.169.254)
-/// or its IPv4-mapped IPv6 equivalent. Always blocked regardless of config.
+/// or its IPv4-mapped/compatible IPv6 equivalent. Always blocked regardless
+/// of config.
 fn is_cloud_metadata(ip: &std::net::IpAddr) -> bool {
     use std::net::Ipv4Addr;
     let metadata = Ipv4Addr::new(169, 254, 169, 254);
     match ip {
         std::net::IpAddr::V4(v4) => *v4 == metadata,
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4 == metadata),
+        std::net::IpAddr::V6(v6) => ipv6_embedded_ipv4(v6).is_some_and(|v4| v4 == metadata),
     }
 }
 
@@ -223,8 +249,19 @@ fn is_dangerous_ip(ip: &std::net::IpAddr, allow_local: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => is_dangerous_ipv4(v4, allow_local),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                is_dangerous_ipv4(&v4, allow_local)
+            if let Some(v4) = ipv6_embedded_ipv4(v6) {
+                if is_dangerous_ipv4(&v4, allow_local) {
+                    return true;
+                }
+                // The embedded IPv4 is not dangerous (or allowed by
+                // allow_local), but the address itself might still be
+                // dangerous as a native IPv6 address. For example, ::1 is
+                // both IPv4-compatible 0.0.0.1 AND the IPv6 loopback.
+                let is_loopback = v6.is_loopback();
+                if allow_local && is_loopback {
+                    return false;
+                }
+                is_loopback
             } else {
                 let is_loopback = v6.is_loopback();
                 let is_ula = (v6.octets()[0] & 0xfe) == 0xfc; // fc00::/7
@@ -246,7 +283,7 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
         std::net::IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            if let Some(v4) = ipv6_embedded_ipv4(v6) {
                 v4.is_private() || v4.is_loopback()
             } else {
                 v6.is_loopback() || (v6.octets()[0] & 0xfe) == 0xfc // ULA fc00::/7
@@ -322,7 +359,7 @@ pub(crate) fn validate_base_url(
             std::net::IpAddr::V6(v6) => {
                 if v6.is_loopback() || (v6.octets()[0] & 0xfe) == 0xfc {
                     " Set LLM_ALLOW_LOCAL_NETWORK=true to allow local network endpoints."
-                } else if let Some(v4) = v6.to_ipv4_mapped() {
+                } else if let Some(v4) = ipv6_embedded_ipv4(v6) {
                     if v4.is_private() || v4.is_loopback() {
                         " Set LLM_ALLOW_LOCAL_NETWORK=true to allow local network endpoints."
                     } else {
@@ -350,8 +387,25 @@ pub(crate) fn validate_base_url(
             return Ok(());
         }
         if !allow_local {
+            // Only suggest LLM_ALLOW_LOCAL_NETWORK for private/LAN IPs where
+            // it would actually help. For public hosts the env var won't make
+            // HTTP valid — the user should switch to HTTPS.
             let hint = if hint_local_env {
-                " Set LLM_ALLOW_LOCAL_NETWORK=true to allow local network endpoints."
+                let ip_host = host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(host);
+                if let Ok(ip) = ip_host.parse::<IpAddr>() {
+                    if ip.is_loopback() || is_private_ip(&ip) {
+                        " Set LLM_ALLOW_LOCAL_NETWORK=true to allow local network endpoints."
+                    } else {
+                        ""
+                    }
+                } else {
+                    // Hostname — conservatively suggest the env var since it
+                    // might resolve to a private IP (e.g. a local DNS name).
+                    " Set LLM_ALLOW_LOCAL_NETWORK=true to allow local network endpoints."
+                }
             } else {
                 ""
             };
@@ -370,7 +424,14 @@ pub(crate) fn validate_base_url(
 
     // Validate the host IP (both HTTP with allow_local and HTTPS).
     // Check both IP literals and resolved hostnames to prevent DNS-based SSRF.
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    //
+    // `Url::host_str()` includes brackets for IPv6 literals (e.g. "[::1]"),
+    // so strip them before attempting IP address parsing.
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = ip_host.parse::<IpAddr>() {
         if is_dangerous_ip(&ip, allow_local) {
             return Err(ConfigError::InvalidValue {
                 key: field_name.to_string(),
@@ -1009,5 +1070,85 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("must be 'true' or 'false'"), "got: {err}");
         unsafe { std::env::remove_var("LLM_ALLOW_LOCAL_NETWORK") };
+    }
+
+    // --- IPv4-compatible IPv6 tests (::A.B.C.D form) ---
+
+    #[test]
+    fn ipv4_compatible_ipv6_metadata_blocked() {
+        // ::169.254.169.254 (IPv4-compatible form) must be blocked as cloud metadata.
+        // This is the deprecated ::A.B.C.D form, distinct from ::ffff:A.B.C.D (mapped).
+        assert!(
+            validate_base_url("https://[::169.254.169.254]", "TEST", false, true).is_err(),
+            "IPv4-compatible metadata should be blocked"
+        );
+        assert!(
+            validate_base_url("https://[::169.254.169.254]", "TEST", true, true).is_err(),
+            "IPv4-compatible metadata should be blocked even with allow_local"
+        );
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_private_blocked_without_allow_local() {
+        // ::10.0.0.1 and ::192.168.1.1 (IPv4-compatible form) should be blocked
+        // when allow_local is false, just like their IPv4 counterparts.
+        assert!(
+            validate_base_url("https://[::10.0.0.1]", "TEST", false, true).is_err(),
+            "IPv4-compatible private IP should be blocked without allow_local"
+        );
+        assert!(
+            validate_base_url("https://[::192.168.1.1]", "TEST", false, true).is_err(),
+            "IPv4-compatible private IP should be blocked without allow_local"
+        );
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_private_allowed_with_allow_local() {
+        // ::10.0.0.1 and ::192.168.1.1 (IPv4-compatible form) should be allowed
+        // when allow_local is true, just like their IPv4 counterparts.
+        let result1 = validate_base_url("https://[::10.0.0.1]", "TEST", true, true);
+        assert!(
+            result1.is_ok(),
+            "IPv4-compatible private IP should be allowed with allow_local, got: {result1:?}"
+        );
+        let result2 = validate_base_url("https://[::192.168.1.1]", "TEST", true, true);
+        assert!(
+            result2.is_ok(),
+            "IPv4-compatible private IP should be allowed with allow_local, got: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_cgn_blocked() {
+        // ::100.64.0.1 (IPv4-compatible CGN) must remain blocked even with allow_local.
+        assert!(
+            validate_base_url("https://[::100.64.0.1]", "TEST", true, true).is_err(),
+            "IPv4-compatible CGN should be blocked even with allow_local"
+        );
+    }
+
+    #[test]
+    fn http_hint_not_shown_for_public_ip() {
+        // For public IPs over HTTP, setting LLM_ALLOW_LOCAL_NETWORK won't help
+        // since public IPs are still rejected over HTTP. Don't suggest it.
+        let err = validate_base_url("http://8.8.8.8", "TEST", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("LLM_ALLOW_LOCAL_NETWORK"),
+            "HTTP error for public IP should not suggest LLM_ALLOW_LOCAL_NETWORK, got: {err}"
+        );
+    }
+
+    #[test]
+    fn http_hint_shown_for_private_ip() {
+        // For private IPs over HTTP, suggest LLM_ALLOW_LOCAL_NETWORK since it would help.
+        let err = validate_base_url("http://192.168.1.100", "TEST", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("LLM_ALLOW_LOCAL_NETWORK"),
+            "HTTP error for private IP should suggest LLM_ALLOW_LOCAL_NETWORK, got: {err}"
+        );
     }
 }
