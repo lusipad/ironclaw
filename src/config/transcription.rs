@@ -1,6 +1,8 @@
 use secrecy::SecretString;
 
-use crate::config::helpers::{optional_env, parse_bool_env, validate_base_url};
+use crate::config::helpers::{
+    allow_local_network, optional_env, parse_bool_env, validate_base_url,
+};
 use crate::error::ConfigError;
 use crate::settings::Settings;
 
@@ -39,10 +41,11 @@ impl Default for TranscriptionConfig {
 
 impl TranscriptionConfig {
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
-        let enabled = parse_bool_env(
-            "TRANSCRIPTION_ENABLED",
-            settings.transcription.as_ref().is_some_and(|t| t.enabled),
-        )?;
+        // Tri-state: Some(true/false) = explicit DB value, None = unset (fall back to env).
+        let enabled = match settings.transcription.as_ref().map(|t| t.enabled) {
+            Some(db_enabled) => db_enabled,
+            None => parse_bool_env("TRANSCRIPTION_ENABLED", false)?,
+        };
 
         let provider =
             optional_env("TRANSCRIPTION_PROVIDER")?.unwrap_or_else(|| "openai".to_string());
@@ -62,7 +65,7 @@ impl TranscriptionConfig {
 
         // Validate base URL to prevent SSRF (#1103).
         if let Some(ref url) = base_url {
-            validate_base_url(url, "TRANSCRIPTION_BASE_URL")?;
+            validate_base_url(url, "TRANSCRIPTION_BASE_URL", allow_local_network()?, true)?;
         }
 
         Ok(Self {
